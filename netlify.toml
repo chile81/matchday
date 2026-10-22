@@ -1,0 +1,5 @@
+# Netlify deploys only the app/ folder (no build step). SQL, tests and docs are never served.
+
+[build]
+  publish = "app"
+  command = ""

@@ -1,0 +1,33 @@
+/* MatchDay service worker — full offline app shell */
+const CACHE = 'matchday-v0.14.3';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './qrcode.js', './jsqr.js'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  if (new URL(e.request.url).origin !== location.origin) return; // cloud/API calls go straight to network
+  e.respondWith(
+    caches.match(e.request, { ignoreSearch: true }).then(hit =>
+      hit ||
+      fetch(e.request).then(resp => {
+        // cache same-origin successes so updates land in cache too
+        if (resp.ok && new URL(e.request.url).origin === location.origin) {
+          const copy = resp.clone();
+          caches.open(CACHE).then(c => c.put(e.request, copy));
+        }
+        return resp;
+      }).catch(() => caches.match('./index.html'))
+    )
+  );
+});

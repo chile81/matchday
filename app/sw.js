@@ -1,5 +1,5 @@
 /* MatchDay service worker — full offline app shell */
-const CACHE = 'matchday-v0.14.3';
+const CACHE = 'matchday-v0.14.4';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './qrcode.js', './jsqr.js'];
 
 self.addEventListener('install', e => {

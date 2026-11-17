@@ -145,7 +145,7 @@ a{color:var(--accent2);}
    MatchDay v0.1 — offline roster check-in & reference capture
    Vibrant Valley Photography
    ============================================================ */
-const VERSION = '0.14.3';
+const VERSION = '0.14.4';
 
 /* ---------- tiny helpers ---------- */
 const $ = sel => document.querySelector(sel);
@@ -1095,6 +1095,83 @@ function foldSummary(f) {
   if (f.skipped) bits.push(`${f.skipped} already here`);
   return bits.length ? bits.join(', ') : 'Nothing new in that file';
 }
+/* ---------- v0.14.4: add a field (column) to the job while on site ----------
+   A roster arrives without jersey numbers, or the coach wants positions noted. A field is
+   just one more entry in shoot.columns; every person's value lives in their own `extra`,
+   which already syncs. What did NOT travel before this was the column LIST itself — the
+   cloud row carried it up but no phone ever read it back — so it now merges as a union
+   everywhere a job is exchanged (cloud pull, QR sync, shoot share, backup ZIP). A union can
+   only grow, so two phones adding different fields at the same moment both keep both.
+   Person ids and the job's sync key are computed at import and are not touched by this. */
+const cleanFieldName = v => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, 40);
+const fieldKey = v => norm(v).replace(/\s+/g, '');
+function fieldProblem(name) {
+  if (!name) return 'Type a name for the field';
+  const k = fieldKey(name);
+  if (['first', 'firstname', 'last', 'lastname'].includes(k.replace(/[^a-z]/g, ''))) return 'First and last name already have their own boxes';
+  const hit = (S.shoot.columns || []).find(c => fieldKey(c) === k);
+  return hit ? `This job already has “${hit}”` : '';
+}
+/* merge column names into the open job; `mine` = added on this device, so the cloud is owed it */
+async function adoptColumns(cols, mine) {
+  if (!S.shoot || !Array.isArray(cols)) return 0;
+  const have = new Set(S.shoot.columns || []);
+  const add = [];
+  for (const c of cols) {
+    if (typeof c !== 'string' || !c || have.has(c)) continue;
+    have.add(c); add.push(c);
+  }
+  if (!add.length) return 0;
+  S.shoot.columns = [...(S.shoot.columns || []), ...add];
+  if (mine) { S.shoot.colsDirty = true; S.shoot.updatedAt = nowISO(); }
+  await dbPut('shoots', S.shoot);
+  return add.length;
+}
+async function addField(raw) {
+  const name = cleanFieldName(raw);
+  const prob = fieldProblem(name);
+  if (prob) { toast(prob); return ''; }
+  await adoptColumns([name], true);
+  // no direct push: the tick pulls first, so a rename made on another phone isn't sent back over
+  if (cloudReady()) scheduleAutoSync(800);
+  return name;
+}
+const FIELD_IDEAS = ['Jersey #', 'Position', 'Grade', 'Notes'];
+function askFieldName() {
+  return new Promise(res => {
+    const bg = document.createElement('div'); bg.className = 'sheet-bg';
+    const sheet = document.createElement('div'); sheet.className = 'sheet';
+    let settled = false;
+    const finish = v => { if (!settled) { settled = true; res(v); } };
+    const closer = trackSheet(bg, sheet, () => finish(''));
+    const done = v => { closer(); finish(v); };
+    bg.onclick = () => done('');
+    const ideas = FIELD_IDEAS.filter(n => !fieldProblem(n));
+    sheet.innerHTML = `<h3>Add a field to this job</h3>
+      <p style="color:var(--dim);font-size:13.5px;margin:0 0 12px;line-height:1.5">A new box on every person in “${esc(S.shoot.name)}”. It reaches the other phones at the next sync and is a column in the exports.</p>
+      <input type="text" id="nfName" placeholder="e.g. Jersey #" maxlength="40" autocomplete="off">
+      ${ideas.length ? `<div class="chiprow">${ideas.map(n => `<button type="button" class="chip sm" data-idea="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
+      <button class="btn primary" id="nfAdd" style="margin-top:14px">Add field</button>
+      <button class="btn ghost" id="nfCancel" style="margin-top:10px">Cancel</button>`;
+    document.body.append(bg, sheet);
+    const inp = sheet.querySelector('#nfName');
+    const submit = () => {
+      const name = cleanFieldName(inp.value);
+      const prob = fieldProblem(name);
+      if (prob) { toast(prob); inp.focus(); return; }
+      done(name);
+    };
+    sheet.querySelectorAll('[data-idea]').forEach(ch => ch.onclick = () => { inp.value = ch.dataset.idea; inp.focus(); });
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    sheet.querySelector('#nfAdd').onclick = submit;
+    sheet.querySelector('#nfCancel').onclick = () => done('');
+    inp.focus();
+  });
+}
+async function addFieldFlow() {
+  const name = await askFieldName();
+  return name ? addField(name) : '';
+}
 function preferredBoardCol(filts) {
   for (const name of TEAMISH) {
     const hit = filts.find(([c]) => norm(c).replace(/[^a-z]/g, '') === name);
@@ -1886,6 +1963,8 @@ async function renderSubject(subjectId) {
         ${p.chips ? `<div class="chiprow" data-chipcol="${esc(c)}">${p.values.map(v => `<button type="button" class="chip sm" data-val="${esc(v)}">${esc(v)}</button>`).join('')}</div>
         <div class="fhint">Tap to add • tap again to remove${p.multi ? ' — two taps for a two-team athlete' : ''}</div>` : ''}`;
       }).join('')}
+      <div id="newFields"></div>
+      <button type="button" class="chip sm" id="addFieldBtn" style="margin:14px 0 0;border-style:dashed">＋ Add a field to this job</button>
       ${!isNew && !isDone(s) ? `
         <label class="f" style="margin-top:18px">Not photographed — why?</label>
         <div class="chiprow" id="flagRow">
@@ -1941,6 +2020,22 @@ async function renderSubject(subjectId) {
     finally { saving = false; }
   };
   if (!isNew) LEAVE_HOOK = saveIfChanged;      // route() runs it before any other screen paints
+  // v0.14.4: a new field drops into the form in place — nothing typed so far is lost
+  $('#addFieldBtn').onclick = async () => {
+    const was = changed();
+    const name = await addFieldFlow();
+    const host = $('#newFields');
+    if (!name || !host) return;
+    const lab = document.createElement('label');
+    lab.className = 'f';
+    lab.innerHTML = `${esc(name)} <span style="color:var(--accent2)">• new field</span>`;
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'eExtra'; inp.dataset.col = name; inp.autocomplete = 'off';
+    host.append(lab, inp);
+    if (!was) savedKey = formKey(readForm()); // an empty new box is not an edit to save
+    inp.focus();
+    toast(`“${name}” added to this job`, true);
+  };
   const sb_ = $('#saveBtn');
   sb_.addEventListener('pointerdown', e => e.preventDefault()); // keep the keyboard → no layout jump
   sb_.onclick = async () => {
@@ -2077,6 +2172,7 @@ async function buildSyncPayload() {
     k: S.shoot.syncKey || '',
     d: DEVICE.name || DEVICE.id,
     ei, ex, hi, hx, fi, fx,
+    c: S.shoot.columns || [],   // v0.14.4: fields added on site ride along (older phones ignore it)
     a: S.subjects.filter(s => s.added).map(s => ({ k: s.id, f: s.first, l: s.last, x: s.extra || {}, at: s.addedAt || '', by: s.addedBy || '' }))
   };
   const raw = new TextEncoder().encode(JSON.stringify(obj));
@@ -2098,6 +2194,7 @@ async function applySync(obj) {
     if (!confirm('This code is from a DIFFERENT roster/shoot (or one phone loaded an edited CSV). Names added on site will still merge; roster check-ins cannot. Continue?')) return null;
   }
   let newCaps = 0, newUndo = 0, newAdd = 0, newHand = 0;
+  if (sameRoster) await adoptColumns(obj.c);
   for (const a of obj.a || []) {
     if (!S.subjects.find(s => s.id === a.k)) {
       // v0.14.0: adopt the id as sent. Another job on this phone may hold the same key —
@@ -2180,6 +2277,7 @@ async function receiveSharedShoot(obj) {
     S.R = new Map();
   } else {
     await loadShoot(shoot.id);
+    await adoptColumns(obj.cols);
   }
   let added = 0, statuses = 0;
   for (const row of obj.subs || []) {
@@ -2479,6 +2577,7 @@ function exportSheet() {
     <button class="btn" id="shareShootBtn" style="margin-bottom:10px">${ICONS.out.replace('svg ', 'svg width=18 ')} Share whole shoot to another phone</button>
     <button class="btn ${cloudReady() && pendingCount() ? 'primary' : ''}" id="cloudBtn" style="margin-bottom:16px;${cloudReady() && !pendingCount() ? 'border-color:rgba(62,207,142,.5)' : ''}">☁ Cloud Sync now${cloudReady() ? (pendingCount() ? ` — ${pendingCount()} photo${pendingCount() === 1 ? '' : 's'} still to upload` : '') : ' (set up in Settings)'}</button>
     <button class="btn" id="addonBtn" style="margin-bottom:10px">${ICONS.addPerson.replace('svg ', 'svg width=18 ')} Import add-on CSV (new names)</button>
+    <button class="btn" id="addFieldBtn2" style="margin-bottom:10px">${ICONS.add.replace('svg ', 'svg width=18 ')} Add a field to this job (e.g. Jersey #)</button>
     <button class="btn" id="mergeZipBtn" style="margin-bottom:16px">${ICONS.add.replace('svg ', 'svg width=18 ')} Merge backup ZIP (other phone's photos)</button>
     ${fillCand.map((f, i) => `<button class="btn" id="fillName${i}" style="margin-bottom:10px">✎ Fill “${esc(f.col)}” from names (${f.blanks} blank)</button>`).join('')}
     <button class="btn" id="syncCheckBtn" style="margin-bottom:10px">🩺 Sync check (why don't our phones agree?)</button>
@@ -2519,6 +2618,11 @@ function exportSheet() {
   $('#showSyncBtn').onclick = async () => { close(); await showSyncCode(); };
   $('#scanSyncBtn').onclick = async () => { close(); await scanSyncCode(); };
   $('#addonBtn').onclick = () => { close(); S.appendTo = S.shoot.id; $('#csvInput').click(); };
+  $('#addFieldBtn2').onclick = async () => {
+    close();
+    const name = await addFieldFlow();
+    if (name) toast(`“${name}” added — open a person to fill it in`, true);
+  };
   $('#shareShootBtn').onclick = async () => { close(); await showShootShare(); };
   $('#mergeZipBtn').onclick = () => { close(); $('#zipInput').click(); };
   $('#cloudBtn').onclick = async () => { close(); await cloudSyncNow(); };
@@ -2717,7 +2821,7 @@ async function cloudPushShootMeta() {
   const key = S.shoot.syncKey;
   await flushSubjectDeletes();
   await cloudPushShootRow(S.shoot);
-  if (S.shoot.metaDirty) { S.shoot.metaDirty = false; await dbPut('shoots', S.shoot); } // rename/archive is now the cloud's copy too
+  if (S.shoot.metaDirty || S.shoot.colsDirty) { S.shoot.metaDirty = false; S.shoot.colsDirty = false; await dbPut('shoots', S.shoot); } // rename/archive/new field is now the cloud's copy too
   const subs = S.subjects.map(s => subRow(s, key));
   for (let i = 0; i < subs.length; i += 200) await pushSubjectRows(subs.slice(i, i + 200));
   for (const s of S.subjects) if (s.dirty) { delete s.dirty; await dbPut('subjects', s); } // the full-roster push settles every queued edit
@@ -2764,20 +2868,27 @@ async function cloudPull(progress) {
   const key = S.shoot.syncKey;
   // a rename on another phone comes down with the shoot row; a rename made HERE and not
   // yet pushed (metaDirty) wins, so an offline rename isn't undone by the next sync
-  let renamed = '';
-  if (!S.shoot.metaDirty) {
-    try {
-      const meta = (await sbJson(`/rest/v1/md_shoots?sync_key=eq.${key}&select=*`)) || [];
-      const m = meta[0];
-      if (m) {
+  let renamed = '', newCols = 0;
+  try {
+    const meta = (await sbJson(`/rest/v1/md_shoots?sync_key=eq.${key}&select=*`)) || [];
+    const m = meta[0];
+    if (m) {
+      if (!S.shoot.metaDirty) {
         let touched = false;
         if (m.name && m.name !== S.shoot.name) { S.shoot.name = m.name; renamed = m.name; touched = true; }
         if (m.shoot_date && m.shoot_date !== (S.shoot.shootDate || '')) { S.shoot.shootDate = m.shoot_date; touched = true; }
         if ('archived' in m && !!m.archived !== !!S.shoot.archived) { S.shoot.archived = !!m.archived; touched = true; }
         if (touched) await dbPut('shoots', S.shoot);
       }
-    } catch (e) { /* not fatal — carry on with the roster pull */ }
-  }
+      // v0.14.4: fields added on another phone. Always a union, never a replace — and if this
+      // phone holds a field the cloud's list lacks, the cloud is owed it (the tick sends it).
+      if (Array.isArray(m.columns)) {
+        newCols = await adoptColumns(m.columns);
+        const theirs = new Set(m.columns);
+        if (!S.shoot.colsDirty && (S.shoot.columns || []).some(c => !theirs.has(c))) { S.shoot.colsDirty = true; await dbPut('shoots', S.shoot); }
+      }
+    }
+  } catch (e) { /* not fatal — carry on with the roster pull */ }
   const subs = (await sbJson(`/rest/v1/md_subjects?shoot_key=eq.${key}&select=*`)) || [];
   let addSub = 0, remSub = 0, flagChanged = 0, editSub = 0;
   for (const ms of subs) {
@@ -2896,7 +3007,7 @@ async function cloudPull(progress) {
   }
   for (const arr of S.caps.values()) arr.sort((a, b) => a.takenAt < b.takenAt ? -1 : 1);
   sortSubjects();
-  return { addSub, remSub, got, stChanged, renamed, flagChanged, editSub };
+  return { addSub, remSub, got, stChanged, renamed, flagChanged, editSub, newCols };
 }
 let cloudBusy = false;
 /* ---------- live cloud ---------------------------------------------------
@@ -3009,6 +3120,14 @@ async function autoSyncTick() {
       if (r.got) toast(`☁ +${r.got} check-in${r.got > 1 ? 's' : ''} from cloud`, true);
       if (location.hash.startsWith('#/shoot/') && $('#list')) drawList();
       else if (location.hash.startsWith('#/watch/')) renderWatch();
+    }
+    if (r.newCols) toast(`☁ ${r.newCols} new field${r.newCols > 1 ? 's' : ''} added to this job`, true);
+    if (S.shoot.colsDirty) {           // a field added here — after the pull, so the row we send is current
+      try {
+        await cloudPushShootRow(S.shoot);
+        S.shoot.colsDirty = false; S.shoot.metaDirty = false;
+        await dbPut('shoots', S.shoot);
+      } catch (e) { /* next tick */ }
     }
     const before = pendingCount();
     await flushSubjectDeletes().catch(() => {});
@@ -3124,6 +3243,7 @@ async function importBackupZip(f) {
     if (!confirm('This backup is from a DIFFERENT roster/shoot. Merge anyway?')) return;
   }
   const by = (man.device && (man.device.name || man.device.id)) || 'import';
+  await adoptColumns((man.shoot || {}).columns);
   // merge subjects we don't know (their walk-ups) + handled flags
   let addSub = 0;
   for (const ms of man.subjects || []) {
